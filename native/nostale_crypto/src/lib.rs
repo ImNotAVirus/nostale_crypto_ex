@@ -115,11 +115,11 @@ fn decrypt_channel_packet(packet: &[u8], offset: u8, mode: u8) -> Vec<u8> {
     let mut decrypted_packet = Vec::with_capacity(packet.len());
     for b in packet {
         decrypted_packet.push(match mode {
-            0 => b.wrapping_sub(offset),
-            1 => b.wrapping_add(offset),
-            2 => b.wrapping_sub(offset) ^ 0xC3,
-            3 => b.wrapping_add(offset) ^ 0xC3,
-            _ => unreachable!(),
+            0 => b.wrapping_sub(offset).wrapping_sub(0x40),
+            1 => b.wrapping_add(offset).wrapping_add(0x40),
+            2 => (b.wrapping_sub(offset).wrapping_sub(0x40)) ^ 0xC3,
+            3 => (b.wrapping_add(offset).wrapping_add(0x40)) ^ 0xC3,
+            _ => b.wrapping_sub(0xF),
         })
     }
     decrypted_packet
@@ -136,61 +136,59 @@ pub fn world_channel_unpack<'a>(env: Env<'a>, packet: Binary<'a>) -> Binary<'a> 
 fn unpack_channel_packet(packet: &[u8]) -> Vec<u8> {
     let mut decrypted_packet = Vec::with_capacity(packet.len());
     let mut index = 0;
-    while index < packet.len() {
-        let flag = packet[index];
-        let payload = &packet[index + 1..];
-
-        if flag <= 0x7A {
-            let mut first = vec![0; payload.len()];
-            let n = decode_packed_linear_packet(&mut first, payload, flag);
-            decrypted_packet.extend_from_slice(&first[0..n]);
-            index += n + 1;
-        } else {
-            let mut first = vec![0; payload.len() * 2];
-            let (ndst, nsrc) = decode_packed_compact_packet(&mut first, payload, flag & 0x7F);
-            decrypted_packet.extend_from_slice(&first[0..ndst]);
-            index += nsrc + 1;
-        }
+    while packet.len() > index {
+        index += unpack_channel_payload(&mut decrypted_packet, &packet[index..]);
     }
     decrypted_packet
 }
 
-fn decode_packed_linear_packet(dst: &mut [u8], src: &[u8], flag: u8) -> usize {
-    let mut l = flag as usize;
-    if l > src.len() {
-        l = src.len();
-    }
-    for n in 0..l {
-        dst[n] = src[n] ^ 0xFF;
-    }
-    l
+fn unpack_channel_payload(dst: &mut Vec<u8>, src: &[u8]) -> usize {
+    let mut index = 0;
+    let len: usize = (src[index] & 0x7F).into();
+    let flag = src[index] & 0x80;
+    index += 1;
+    index += if flag != 0 {
+        unpack_channel_compact_payload(dst, &src[index..], len)
+    } else {
+        unpack_channel_linear_payload(dst, &src[index..], len)
+    };
+    index
 }
 
-const PERMUTATIONS: [u8; 14] = [
-    b' ', b'-', b'.', b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'n',
+const UNPACK_DECRYPTION_PERMUTATIONS: [u8; 16] = [
+    0x00, 0x20, 0x2D, 0x2E, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0xFF, 0x00,
 ];
 
-fn decode_packed_compact_packet(dst: &mut [u8], src: &[u8], flag: u8) -> (usize, usize) {
-    let mut buff = src;
-    let mut ndst = 0;
-    let mut nsrc = 0;
-    while ndst < flag as usize && buff.len() > 0 {
-        let h = (buff[0] >> 4) as usize;
-        let l = (buff[0] & 0x0F) as usize;
-        buff = &buff[1..];
-        if h != 0 && h != 0xF && (l == 0 || l == 0xF) {
-            dst[ndst] = PERMUTATIONS[h - 1];
-        } else if l != 0 && l != 0xF && (h == 0 || h == 0xF) {
-            dst[ndst] = PERMUTATIONS[l - 1];
-        } else if h != 0 && h != 0xF && l != 0 && l != 0xF {
-            dst[ndst] = PERMUTATIONS[h - 1];
-            ndst += 1;
-            dst[ndst] = PERMUTATIONS[l - 1];
+fn unpack_channel_compact_payload(dst: &mut Vec<u8>, src: &[u8], len: usize) -> usize {
+    let mut index = 0;
+    for _ in 0..((len + 1) / 2) {
+        if index >= src.len() {
+            break;
         }
-        ndst += 1;
-        nsrc += 1;
+        let two_chars = src[index];
+        index += 1;
+        let left_char: usize = (two_chars >> 4).into();
+        dst.push(UNPACK_DECRYPTION_PERMUTATIONS[left_char]);
+        let right_char: usize = (two_chars & 0xF).into();
+        if right_char == 0 {
+            break;
+        }
+        dst.push(UNPACK_DECRYPTION_PERMUTATIONS[right_char]);
     }
-    (ndst, nsrc)
+    index
+}
+
+fn unpack_channel_linear_payload(dst: &mut Vec<u8>, src: &[u8], len: usize) -> usize {
+    dst.reserve(len);
+    let mut index = 0;
+    for _ in 0..len {
+        if index >= src.len() {
+            break;
+        }
+        dst.push(src[index] ^ 0xFF);
+        index += 1;
+    }
+    index
 }
 
 fn decrypt_session_byte(key: u8) -> u8 {
@@ -206,11 +204,11 @@ fn decrypt_session_byte(key: u8) -> u8 {
 /// Decrypt the delimiter from a key.
 fn pack_delimiter(offset: u8, mode: u8) -> u8 {
     match mode {
-        0 => 0xFF_u8.wrapping_add(offset),
-        1 => 0xFF_u8.wrapping_sub(offset),
-        2 => 0xFF_u8.wrapping_add(offset) ^ 0xC3,
-        3 => 0xFF_u8.wrapping_sub(offset) ^ 0xC3,
-        _ => unreachable!(),
+        0 => 0xFFu8.wrapping_add(offset).wrapping_add(0x40),
+        1 => 0xFFu8.wrapping_sub(offset).wrapping_sub(0x40),
+        2 => (0xFFu8 ^ 0xC3).wrapping_add(offset).wrapping_add(0x40),
+        3 => (0xFFu8 ^ 0xC3).wrapping_sub(offset).wrapping_sub(0x40),
+        _ => 0xFFu8.wrapping_add(0xF),
     }
 }
 
@@ -221,7 +219,7 @@ fn cipher_offset(key: u16) -> u8 {
 
 /// Decrypt the mode from a key.
 fn cipher_mode(key: u16) -> u8 {
-    (key >> (6 & 3)) as u8
+    ((key >> 6) & 3) as u8
 }
 
 /// Get the next packet from a raw binary.
