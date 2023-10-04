@@ -18,15 +18,19 @@ fn login_next<'a>(env: Env<'a>, raw: Binary<'a>) -> (Option<Binary<'a>>, Binary<
 
 #[rustler::nif]
 fn login_encrypt<'a>(env: Env<'a>, raw: String) -> Binary<'a> {
-    let enc: Vec<u8> = encrypt_login_packet(raw.as_bytes());
+    let mut enc = Vec::with_capacity(raw.len());
+    encrypt_login_packet(&mut enc, raw.as_bytes());
     let mut binary = NewBinary::new(env, enc.len());
     binary.as_mut_slice().copy_from_slice(&enc);
 
     binary.into()
 }
 
-fn encrypt_login_packet(raw: &[u8]) -> Vec<u8> {
-    raw.iter().map(|x| x.wrapping_add(0xf)).collect()
+fn encrypt_login_packet(dst: &mut Vec<u8>, raw: &[u8]) -> usize {
+    for x in raw {
+        dst.push(x.wrapping_add(0xf))
+    }
+    raw.len()
 }
 
 #[rustler::nif]
@@ -59,62 +63,67 @@ fn world_next<'a>(env: Env<'a>, raw: Binary<'a>, key: u16) -> (Option<Binary<'a>
 
 #[rustler::nif]
 fn world_encrypt<'a>(env: Env<'a>, raw: String) -> Binary<'a> {
-    let enc = encrypt_world_packet(raw.as_bytes());
+    let mut enc = Vec::with_capacity(raw.len() + 1);
+    encrypt_world_packet(&mut enc, raw.as_bytes());
     let mut binary = NewBinary::new(env, enc.len());
     binary.as_mut_slice().copy_from_slice(&enc);
     binary.into()
 }
 
-pub fn encrypt_world_packet(packet: &[u8]) -> Vec<u8> {
+pub fn encrypt_world_packet(dst: &mut Vec<u8>, packet: &[u8]) -> usize {
     let bytes = packet.iter().enumerate();
     let len = bytes.len();
-    let mut encrypted_packet = Vec::with_capacity(len + 1);
     for (i, c) in bytes {
         if i % 0x7E != 0 {
-            encrypted_packet.push(!c);
+            dst.push(!c);
         } else {
             let remaining = if len - i > 0x7E { 0x7E } else { len - i };
-            encrypted_packet.push(remaining.try_into().unwrap());
-            encrypted_packet.push(!c);
+            dst.push(remaining.try_into().unwrap());
+            dst.push(!c);
         }
     }
-    encrypted_packet.push(0xFF);
-    encrypted_packet
+    dst.push(0xFF);
+    packet.len()
 }
 
 #[rustler::nif]
 pub fn world_session_decrypt<'a>(env: Env<'a>, packet: Binary<'a>) -> Binary<'a> {
-    let enc = decrypt_session_packet(packet.as_slice());
+    let mut enc = Vec::with_capacity(packet.len() * 2);
+    decrypt_session_packet(&mut enc, packet.as_slice());
     let mut binary = NewBinary::new(env, enc.len());
     binary.as_mut_slice().copy_from_slice(&enc);
     binary.into()
 }
 
-fn decrypt_session_packet(packet: &[u8]) -> Vec<u8> {
-    let mut decrypted_packet = Vec::with_capacity(packet.len() * 2);
-    for b in packet {
+fn decrypt_session_packet(dst: &mut Vec<u8>, src: &[u8]) -> usize {
+    for b in src {
         let first_byte = b.wrapping_sub(0xF);
         let second_byte = first_byte & 0xF0;
         let first_key = first_byte - second_byte;
         let second_key = second_byte >> 0x4;
-        decrypted_packet.push(decrypt_session_byte(second_key));
-        decrypted_packet.push(decrypt_session_byte(first_key));
+        dst.push(decrypt_session_byte(second_key));
+        dst.push(decrypt_session_byte(first_key));
     }
-    decrypted_packet
+    src.len()
 }
 
 #[rustler::nif]
 pub fn world_channel_decrypt<'a>(env: Env<'a>, packet: Binary<'a>, key: u16) -> Binary<'a> {
-    let enc = decrypt_channel_packet(packet.as_slice(), cipher_offset(key), cipher_mode(key));
-    let mut binary = NewBinary::new(env, enc.len());
-    binary.as_mut_slice().copy_from_slice(&enc);
+    let mut dec = Vec::with_capacity(packet.len());
+    decrypt_channel_packet(
+        &mut dec,
+        packet.as_slice(),
+        cipher_offset(key),
+        cipher_mode(key),
+    );
+    let mut binary = NewBinary::new(env, dec.len());
+    binary.as_mut_slice().copy_from_slice(&dec);
     binary.into()
 }
 
-fn decrypt_channel_packet(packet: &[u8], offset: u8, mode: u8) -> Vec<u8> {
-    let mut decrypted_packet = Vec::with_capacity(packet.len());
+fn decrypt_channel_packet(dst: &mut Vec<u8>, packet: &[u8], offset: u8, mode: u8) -> usize {
     for b in packet {
-        decrypted_packet.push(match mode {
+        dst.push(match mode {
             0 => b.wrapping_sub(offset).wrapping_sub(0x40),
             1 => b.wrapping_add(offset).wrapping_add(0x40),
             2 => (b.wrapping_sub(offset).wrapping_sub(0x40)) ^ 0xC3,
@@ -122,24 +131,24 @@ fn decrypt_channel_packet(packet: &[u8], offset: u8, mode: u8) -> Vec<u8> {
             _ => b.wrapping_sub(0xF),
         })
     }
-    decrypted_packet
+    packet.len()
 }
 
 #[rustler::nif]
 pub fn world_channel_unpack<'a>(env: Env<'a>, packet: Binary<'a>) -> Binary<'a> {
-    let enc = unpack_channel_packet(packet.as_slice());
-    let mut binary = NewBinary::new(env, enc.len());
-    binary.as_mut_slice().copy_from_slice(&enc);
+    let mut unpacked = Vec::with_capacity(packet.len());
+    unpack_channel_packet(&mut unpacked, packet.as_slice());
+    let mut binary = NewBinary::new(env, unpacked.len());
+    binary.as_mut_slice().copy_from_slice(&unpacked);
     binary.into()
 }
 
-fn unpack_channel_packet(packet: &[u8]) -> Vec<u8> {
-    let mut decrypted_packet = Vec::with_capacity(packet.len());
+fn unpack_channel_packet(dst: &mut Vec<u8>, packet: &[u8]) -> usize {
     let mut index = 0;
     while packet.len() > index {
-        index += unpack_channel_payload(&mut decrypted_packet, &packet[index..]);
+        index += unpack_channel_payload(dst, &packet[index..]);
     }
-    decrypted_packet
+    index
 }
 
 fn unpack_channel_payload(dst: &mut Vec<u8>, src: &[u8]) -> usize {
